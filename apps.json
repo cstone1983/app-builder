@@ -1,0 +1,53 @@
+{
+  "_comment": "One entry per app. version_code_base + the builder run number = the APK's versionCode, so every build installs over the last one. Keep each base above the app's own versionCodes so far.",
+  "apps": [
+    {
+      "id": "voice-keyboard",
+      "repo": "cstone1983/voice-keyboard",
+      "ref": "claude/confident-davinci-7bv787",
+      "type": "gradle",
+      "java": "21",
+      "package": "io.github.cstone1983.voicekeyboard",
+      "version_code_base": 2000000,
+      "gradle_task": ":app:assembleRelease",
+      "apk_dir": "app/build/outputs/apk/release",
+      "prepare": "bash tools/fetch-sherpa-onnx.sh && { [ -f app/src/main/jniLibs/arm64-v8a/libdictate_bergamot.so ] || bash tools/bergamot/build-android.sh arm64-v8a; }",
+      "cache_paths": "src/app/libs/*.jar\nsrc/app/src/main/jniLibs",
+      "cache_key_files": "tools/fetch-sherpa-onnx.sh tools/bergamot/** gradle/tools.versions.toml"
+    },
+    {
+      "id": "sshsync",
+      "repo": "cstone1983/synced-ssh-client",
+      "ref": "ccr-3c73950e-otgid7",
+      "type": "flutter",
+      "flutter": "3.50.1",
+      "java": "17",
+      "dir": "app",
+      "package": "dev.sshsync.sshsync",
+      "version_code_base": 1000,
+      "apk_dir": "build/app/outputs/flutter-apk"
+    },
+    {
+      "id": "hvac",
+      "repo": "cstone1983/HVAC-Android-App",
+      "ref": "main",
+      "type": "gradle",
+      "java": "17",
+      "package": "com.aistudio.hvac_controller.krnyzs",
+      "version_code_base": 1000,
+      "gradle_task": ":app:assembleRelease",
+      "apk_dir": "app/build/outputs/apk/release"
+    },
+    {
+      "id": "nightfall",
+      "repo": "cstone1983/sleep-sounds",
+      "ref": "main",
+      "type": "gradle",
+      "java": "17",
+      "package": "com.cstone.nightfall",
+      "version_code_base": 1000,
+      "gradle_task": ":app:assembleRelease",
+      "apk_dir": "app/build/outputs/apk/release"
+    }
+  ]
+}

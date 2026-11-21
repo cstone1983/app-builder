@@ -1,0 +1,286 @@
+name: android
+
+# build   - checks out the app's source (read-only), builds an UNSIGNED release APK. Never has
+#           access to the release key. Runs app code, so it gets nothing it doesn't need.
+# publish - only on main, in the protected "release-signing" environment: signs the APK built
+#           above (never checks out app code), checks the signer, creates a PRE-release here.
+#           You promote a pre-release to a full release to deploy it; Obtainium only installs
+#           full releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "App id from apps.json, comma list, or all"
+        required: true
+        default: all
+      ref:
+        description: "Branch/tag/commit to build instead of apps.json's ref (one app only)"
+        required: false
+        default: ""
+      publish:
+        description: "Sign and create a pre-release (main only)"
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [build]          # client_payload: {"app": "<id>", "ref": "<optional>"}
+  push:
+    branches-ignore: [main] # builder changes on a branch: test build, never signed or published
+    paths: [apps.json, "ci/**", .github/workflows/android.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: m
+        env:
+          APP: ${{ inputs.app || github.event.client_payload.app || 'all' }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref || '' }}
+        run: python3 ci/matrix.py >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: build ${{ matrix.id }}
+    env:
+      APP_ID: ${{ matrix.id }}
+      APP_PKG: ${{ matrix.package }}
+      APP_DIR: ${{ matrix.dir }}
+      CSA_RUN: ${{ github.run_number }}
+      CSA_VERSION_CODE_BASE: ${{ matrix.version_code_base }}
+    steps:
+      - name: Check out app-builder
+        uses: actions/checkout@v4
+        with:
+          path: builder
+          persist-credentials: false
+
+      - name: Check out ${{ matrix.repo }}@${{ matrix.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+          path: src
+          submodules: recursive
+          persist-credentials: false
+          # Fine-grained, read-only token for private app repos; public repos need none.
+          token: ${{ secrets.SOURCE_READ_TOKEN || github.token }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      - if: matrix.type == 'gradle'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - if: matrix.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ matrix.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Cache key for the app's native libraries
+        id: ck
+        if: matrix.cache_paths != ''
+        working-directory: src
+        env:
+          FILES: ${{ matrix.cache_key_files }}
+        run: |
+          shopt -s globstar nullglob
+          # FILES: space-separated globs relative to the app repo
+          echo "key=$(for f in $FILES; do [ -f "$f" ] && sha256sum "$f"; done | sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - if: matrix.cache_paths != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.cache_paths }}
+          key: native-${{ matrix.id }}-${{ steps.ck.outputs.key }}
+
+      - name: Version
+        id: ver
+        run: |
+          echo "code=$((CSA_VERSION_CODE_BASE + CSA_RUN))" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare (app's own fetch/build steps)
+        if: matrix.prepare != ''
+        working-directory: src/${{ matrix.dir }}
+        env:
+          PREPARE: ${{ matrix.prepare }}
+        run: bash -euo pipefail -c "$PREPARE"
+
+      - name: Build (Gradle, unsigned)
+        if: matrix.type == 'gradle'
+        working-directory: src/${{ matrix.dir }}
+        env:
+          CSA_VERSION_CODE: ${{ steps.ver.outputs.code }}
+          TASK: ${{ matrix.gradle_task }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-configuration-cache \
+            --init-script "$GITHUB_WORKSPACE/builder/ci/unsigned.gradle" "$TASK"
+
+      - name: Build (Flutter)
+        if: matrix.type == 'flutter'
+        working-directory: src/${{ matrix.dir }}
+        env:
+          VC: ${{ steps.ver.outputs.code }}
+        run: |
+          base=$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)
+          flutter build apk --release --build-number "$VC" --build-name "${base:-0.0.0}.$CSA_RUN"
+
+      - name: Collect and check the APK
+        env:
+          APK_DIR: src/${{ matrix.dir }}/${{ matrix.apk_dir }}
+          VC: ${{ steps.ver.outputs.code }}
+          REPO: ${{ matrix.repo }}
+          REF: ${{ matrix.ref }}
+          COMMIT: ${{ steps.ver.outputs.commit }}
+        run: |
+          mapfile -t apks < <(find "$APK_DIR" -maxdepth 1 -name '*.apk' | sort)
+          [ "${#apks[@]}" = 1 ] || { echo "expected one APK in $APK_DIR, found: ${apks[*]:-none}"; exit 1; }
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          badge=$("$bt/aapt2" dump badging "${apks[0]}" | head -1)
+          echo "$badge"
+          pkg=$(sed -nE "s/.*package: name='([^']+)'.*/\1/p" <<<"$badge")
+          code=$(sed -nE "s/.*versionCode='([^']+)'.*/\1/p" <<<"$badge")
+          name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$badge")
+          [ "$pkg" = "$APP_PKG" ] || { echo "package is $pkg, apps.json says $APP_PKG"; exit 1; }
+          [ "$code" = "$VC" ] || { echo "versionCode is $code, expected $VC"; exit 1; }
+          [[ "$name" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "versionName '$name' is not plain dotted numbers"; exit 1; }
+          mkdir -p out
+          cp "${apks[0]}" out/app.apk
+          jq -n --arg id "$APP_ID" --arg pkg "$pkg" --arg name "$name" --arg code "$code" \
+                --arg repo "$REPO" --arg ref "$REF" --arg commit "$COMMIT" \
+                '{id:$id, package:$pkg, version_name:$name, version_code:$code, repo:$repo, ref:$ref, commit:$commit}' \
+                > out/meta.json
+          cat out/meta.json
+          echo "### $APP_ID $name (versionCode $code)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Self-test signing with a throwaway key
+        run: |
+          export KS_FILE="$RUNNER_TEMP/throwaway.jks" KS_PASS="$(openssl rand -hex 16)" KEY_ALIAS=test
+          export KEY_PASS="$KS_PASS" SIGN_SELFTEST=1
+          keytool -genkeypair -keystore "$KS_FILE" -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+            -alias test -keyalg RSA -keysize 2048 -validity 1 -dname "CN=throwaway" >/dev/null 2>&1
+          bash builder/ci/sign.sh out/app.apk "$RUNNER_TEMP/selftest.apk"
+          rm -f "$KS_FILE" "$RUNNER_TEMP/selftest.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.id }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    # Per app: one app failing to build does not stop the others being published.
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'repository_dispatch' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-signing
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: publish ${{ matrix.id }}
+    concurrency:
+      group: publish-${{ matrix.id }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_ID: ${{ matrix.id }}
+    steps:
+      - name: Check out app-builder's scripts (not the app)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+          sparse-checkout: ci
+          persist-credentials: false
+
+      - name: Get the unsigned APK
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: apk-${{ matrix.id }}
+          path: in
+
+      - name: Sign
+        if: steps.dl.outcome == 'success'
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECT_SHA256: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          export KS_FILE="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$KS_FILE"' EXIT
+          base64 -d <<<"$KS_B64" > "$KS_FILE"
+          name=$(jq -r .version_name in/meta.json)
+          mkdir -p dist
+          bash builder/ci/sign.sh in/app.apk "dist/$APP_ID-$name.apk"
+
+      - name: Create pre-release
+        if: steps.dl.outcome == 'success'
+        run: |
+          m=in/meta.json
+          name=$(jq -r .version_name $m); tag="$APP_ID-v$name"
+          {
+            echo "**$APP_ID $name** (versionCode $(jq -r .version_code $m), package \`$(jq -r .package $m)\`)"
+            echo
+            echo "Source: https://github.com/$(jq -r .repo $m)/commit/$(jq -r .commit $m) ($(jq -r .ref $m))"
+            echo "Built by: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Pre-release: not installed by Obtainium until promoted to a full release."
+          } > notes.md
+          gh release create "$tag" "dist/$APP_ID-$name.apk" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --title "$APP_ID $name" --notes-file notes.md
+          echo "tag=$tag" >> "$GITHUB_ENV"
+          echo "Pre-release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune old pre-releases (keep 10 per app; full releases are kept)
+        if: steps.dl.outcome == 'success'
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.prerelease and (.tag_name | startswith(\"$APP_ID-v\"))) | [.created_at, .tag_name] | @tsv" \
+            | sort -r | tail -n +11 | cut -f2 \
+            | while read -r t; do gh release delete "$t" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY"; done
+
+      - name: Notify
+        if: always() && steps.dl.outcome == 'success'
+        env:
+          NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
+          STATUS: ${{ job.status }}
+        run: |
+          [ -n "$NOTIFY_URL" ] || exit 0
+          jq -n --arg app "$APP_ID" --arg status "$STATUS" --arg tag "${tag:-}" \
+                --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                '{app:$app, status:$status, tag:$tag, run:$url}' \
+            | curl -fsS -m 15 -H 'content-type: application/json' --data-binary @- "$NOTIFY_URL" >/dev/null \
+            || echo "notify failed (ignored)"

@@ -1,0 +1,29 @@
+// Init script for app-builder (passed with --init-script). It changes the app's build only for this
+// run and never touches its repository:
+//  - every build type loses its signingConfig, so the release APK comes out unsigned (no app needs
+//    its own keystore, and a build never sees the release key; signing happens in a later job);
+//  - release variants get versionCode = $CSA_VERSION_CODE and versionName = "<app's own>.<$CSA_RUN>".
+import org.gradle.api.Action
+
+def code = System.getenv("CSA_VERSION_CODE")
+def run = System.getenv("CSA_RUN")
+
+allprojects {
+    plugins.withId("com.android.application") {
+        def ac = extensions.getByName("androidComponents")
+        ac.finalizeDsl({ ext ->
+            ext.buildTypes.each { bt -> bt.signingConfig = null }
+        } as Action)
+        ac.onVariants(ac.selector().withBuildType("release"), { variant ->
+            variant.outputs.each { o ->
+                if (code) {
+                    o.versionCode.set(code as Integer)
+                }
+                if (run) {
+                    def base = o.versionName.getOrElse("0")
+                    o.versionName.set("${base}.${run}".toString())
+                }
+            }
+        } as Action)
+    }
+}
