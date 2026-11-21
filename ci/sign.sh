@@ -23,7 +23,7 @@ schemes=$("$bt/apksigner" verify --verbose "$out" | grep -E '^Verified using v[0
 echo "$schemes"
 # v3 always; v2 too when the app runs below Android 9 (minSdk < 28). For minSdk >= 28 apksigner
 # verify only checks v3 and reports v2 as false, which is fine: those devices use v3.
-minsdk=$("$bt/aapt2" dump badging "$out" | sed -nE "s/^sdkVersion:'([0-9]+)'.*/\1/p")
+minsdk=$("$bt/aapt2" dump badging "$out" | sed -nE "s/^(min)?[sS]dkVersion:'([0-9]+)'.*/\2/p" | head -1 || true)
 need="v3"; [ "${minsdk:-1}" -lt 28 ] && need="v2 v3"
 for v in $need; do
   grep -q "^Verified using $v scheme.*: true" <<<"$schemes" || { echo "APK is not signed with $v (minSdk ${minsdk:-?})" >&2; exit 1; }
