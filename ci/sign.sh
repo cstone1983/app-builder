@@ -15,15 +15,22 @@ trap 'rm -rf "$work"' EXIT
 
 # 16 KB alignment for uncompressed native libraries (needed on 16 KB page-size devices).
 "$bt/zipalign" -P 16 -f 4 "$in" "$work/aligned.apk"
-"$bt/apksigner" sign --ks "$KS_FILE" --ks-key-alias "$KEY_ALIAS" \
+"$bt/apksigner" sign --v2-signing-enabled true --v3-signing-enabled true --ks "$KS_FILE" --ks-key-alias "$KEY_ALIAS" \
   --ks-pass env:KS_PASS --key-pass env:KEY_PASS --out "$out" "$work/aligned.apk"
 rm -f "$out.idsig"
 
-"$bt/apksigner" verify --verbose "$out" | grep -E '^Verified using v[0-9]' || true
+schemes=$("$bt/apksigner" verify --verbose "$out" | grep -E '^Verified using v[0-9]' || true)
+echo "$schemes"
+for v in v2 v3; do
+  grep -q "^Verified using $v scheme.*: true" <<<"$schemes" || { echo "APK is not signed with $v" >&2; exit 1; }
+done
 certs=$("$bt/apksigner" verify --print-certs "$out")
-signers=$(grep -c 'certificate SHA-256 digest' <<<"$certs" || true)
-got=$(grep -m1 'Signer #1 certificate SHA-256 digest' <<<"$certs" | awk -F': ' '{print $2}' | tr -d ': ' | tr A-F a-f)
-[ "$signers" = 1 ] || { echo "expected exactly one signer, got $signers" >&2; exit 1; }
+# Line labels differ between build-tools versions ("Signer #1 certificate SHA-256 digest: ..." or
+# "Signer (minSdkVersion=...) certificate SHA-256 digest: ..."); collect the distinct digests.
+digests=$(sed -nE 's/.*certificate SHA-256 digest: *([0-9a-fA-F:]+).*/\1/p' <<<"$certs" | tr -d ':' | tr A-F a-f | sort -u)
+n=$(grep -c . <<<"$digests" || true)
+[ "$n" = 1 ] || { echo "expected exactly one signer certificate, got $n:" >&2; echo "$certs" >&2; exit 1; }
+got=$digests
 echo "signer SHA-256: $got"
 
 if [ "${SIGN_SELFTEST:-0}" != 1 ]; then
